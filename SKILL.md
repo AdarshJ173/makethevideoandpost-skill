@@ -1,7 +1,7 @@
 ---
 name: makethevideoandpost
 description: "Use when sent audio with makethevideoandpost → IG Reel."
-version: 1.1.0
+version: 1.2.0
 author: Hermes Agent (for @inatmania)
 license: MIT
 platforms: [linux]
@@ -18,6 +18,11 @@ pure black & white 1080p video, dead-center bold captions, no b-rolls, one-shot 
 
 Two upload paths exist. **`video_url` ingest is the one that works on this box**; the
 resumable `rupload.facebook.com` POST is kept only as a fallback attempt. See PITFALLS.
+Raw Graph API call sequence (container → poll → publish → permalink): `references/ig-reels-graph-api.md`.
+
+**Maintenance rule:** when a run teaches you something, rewrite the section that misled you.
+Do not append "UPDATE: actually…" notes or a second copy of a rule — the next session reads the
+whole file top-down and will follow whichever version it hits first.
 
 ## When to Use
 
@@ -52,6 +57,12 @@ Do not silently publish a memo the user meant as a draft.
    directly into the final MP4.
 7. Temporary audio/video/subtitle files are deleted after publishing (the script does this;
    pass `--keep-temp` only for debugging).
+8. **Music: dark/melancholic instrumentals only, at `audio_volume: 70`, and never the same track
+   two reels in a row.** `AUDIO_VOLUME_PCT = 70` and the rotation history in
+   `~/.hermes/state/mtvap_music_history.json` implement this. Do not lower the volume back to a
+   "tasteful" 20 and do not disable rotation — both were explicit user instructions.
+9. **Re-publishing to "fix" a post is only allowed after the user deletes the old one.** The API
+   cannot delete IG media, so a re-upload creates a duplicate on the grid; say so before running.
 
 ## How to run
 
@@ -99,11 +110,16 @@ If the run failed, reply with the failure reason and the last `[mtvap]` log line
 - **Feed distribution:** `share_to_feed=false` if a feed post went live <12h ago, else `true`.
 - **Typography:** `Montserrat ExtraBold` @72 (default/impact) or `Poppins ExtraBold` @68 for
   melancholic tone; sizes: 72 for 1080x1920, 68 for 1920x1080.
-- **Music:** Instagram Audio API `GET /ig_audio` mood queries — instrumental only
-  ("dark ambient instrumental", "melancholic piano instrumental", "slow minimal ambient",
-  "calm dark cello"), attached via `audio_configuration` at `audio_volume: 20`.
-  Fallbacks: next candidate (≤2 tries) → container without `audio_configuration` (never fails;
-  licensing subcode 2207065 handled). The `video_url` path honours music the same way — if a
+- **Music:** Instagram Audio API `GET /ig_audio` mood queries — **dark / melancholic instrumentals
+  only** ("dark ambient instrumental", "melancholic piano instrumental", "slow minimal ambient",
+  "calm dark cello"; every mood map leads with these). Attached via `audio_configuration` at
+  **`audio_volume: 70`** (`AUDIO_VOLUME_PCT`) — user-locked preference, never silently lower it.
+  **Rotate the track every run:** used `audio_id`s are recorded in
+  `~/.hermes/state/mtvap_music_history.json` and already-used tracks are pushed behind fresh ones,
+  so two consecutive reels never share background music. Fallbacks: next candidate (≤2 tries) →
+  container without `audio_configuration` (never fails; licensing subcode 2207065 handled).
+- **Music history seeding:** after a run that published with music, `record_music_used()` appends
+  the id; to force a different track on the next run, seed that file with the id just used. The `video_url` path honours music the same way — if a
   manual rescue publishes without `audio_configuration`, report "no music" honestly.
 - **Caption:** hook sentence from the transcript + top account hashtags + niche tags.
 - **Cover:** `thumb_offset=2000` (half the duration if the clip is <2.6s).
@@ -141,10 +157,15 @@ If the run failed, reply with the failure reason and the last `[mtvap]` log line
    `status_code,status`.
 8. **Publish verification is a second call.** `media_publish` returns only a media id; fetch
    `GET /<media_id>?fields=permalink,media_type,timestamp` to get the reel URL you report.
-9. **Clean up after a URL-ingest run:** `agent37 unexpose <port>`, kill the http server, delete
-   the render, then confirm with `agent37 list-exposed`. A crashed run leaves a public port serving
-   the file — that is an accidental public link to the user's content.
-10. **`status_code` polling needs ~60–90 s** before `FINISHED`; poll every 10 s, cap at ~10 min,
+9. **Instagram's Graph API cannot delete a published reel.** `DELETE /<media_id>` returns
+   `(#10) Insufficient permissions`, and `DELETE /<ig-user-id>/media` is unsupported — there is no
+   media-delete endpoint for IG Graph. When the user asks to remove a post, say so plainly and tell
+   them to delete it in the Instagram app; only then re-upload. Never re-publish "as a fix" while
+   the old post is still live — that leaves a duplicate on the grid.
+10. **Clean up after a URL-ingest run:** `agent37 unexpose <port>`, kill the http server, delete
+    the render, then confirm with `agent37 list-exposed`. A crashed run leaves a public port
+    serving the file — an accidental public link to the user's content.
+11. **`status_code` polling needs ~60–90 s** before `FINISHED`; poll every 10 s, cap at ~10 min,
     and do not interpret the first `IN_PROGRESS` as failure.
 
 ## RESCUE PATH — run died after render, before publish
@@ -152,11 +173,17 @@ If the run failed, reply with the failure reason and the last `[mtvap]` log line
 When `--keep-temp` was used (or the run failed mid-way and the temp dir still exists):
 
 1. Find the render: `~/.hermes/cache/scratch/makethevideoandpost-*/reel.mp4` (+ `subs.ass`).
-2. Rebuild the caption without another STT call: import the script as a module, pull the burned-in
-   text out of `subs.ass`, and call `build_caption(text, ctx, mood)` with
-   `ctx = fetch_account_context(user_id, token)`.
-3. Publish through `video_url`: `LocalHoster(tmpdir)` → `create_container_smart(..., video_url=…)`
-   → `wait_finished` → `publish` → `fetch_permalink`.
+2. Publish it with the helper (no second STT call — the caption is rebuilt from `subs.ass`):
+
+```bash
+python3 ~/.hermes/skills/video/makethevideoandpost/scripts/rescue_publish.py \
+  ~/.hermes/cache/scratch/makethevideoandpost-XXXX --share-to-feed
+```
+
+   It creates the container with `video_url`, polls to `FINISHED`, publishes, prints `PERMALINK`.
+   `--dry-run` creates and polls the container without publishing; `--music-mood` attaches audio.
+3. Doing it by hand: `LocalHoster(tmpdir)` → `create_container_smart(..., video_url=…)` →
+   `wait_finished` → `publish` → `fetch_permalink` (import the pipeline script as a module).
 4. Tear down the hoster, then delete the temp dir. Report `upload_mode: video_url` and "no music"
    if `audio_configuration` was not attached.
 
@@ -204,6 +231,10 @@ cp /tmp/mtvap-restore/SKILL.md ~/.hermes/skills/video/makethevideoandpost/SKILL.
 
 ## Changelog
 
+- **1.2.0** — music preferences locked in: dark/melancholic query order for every mood,
+  `audio_volume: 70` (was 20), and per-run track rotation via
+  `~/.hermes/state/mtvap_music_history.json` (`load_music_history` / `record_music_used`).
+  Documented that the Graph API cannot delete media.
 - **1.1.0** — `video_url` ingest path (+ `LocalHoster`, `--upload-mode auto|resumable|url`);
   `-ar 48000` render guard; PITFALLS + RESCUE PATH sections from the failed-upload incident;
   verified end-to-end by publishing https://www.instagram.com/reel/DfryWhVE8PA/.

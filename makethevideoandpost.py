@@ -412,11 +412,35 @@ ENERGETIC_KEYS = ["never", "always", "win", "best", "money", "success", "grind",
 MOOD_QUERIES = {
     "melancholic": ["melancholic piano instrumental", "dark ambient instrumental",
                     "slow minimal ambient", "calm dark cello"],
-    "energetic": ["calm ambient instrumental", "slow minimal ambient",
-                  "dark ambient instrumental", "melancholic piano instrumental"],
+    "energetic": ["dark ambient instrumental", "melancholic piano instrumental",
+                  "slow minimal ambient", "calm dark cello"],
     "neutral": ["slow minimal ambient", "dark ambient instrumental",
                 "calm dark cello", "melancholic piano instrumental"],
 }
+
+# User preference (locked): background music sits at 70% volume, and every run must use a
+# different track than the previous one — dark/melancholic instrumentals only.
+AUDIO_VOLUME_PCT = 70
+MUSIC_HISTORY_FILE = Path.home() / ".hermes" / "state" / "mtvap_music_history.json"
+MUSIC_HISTORY_KEEP = 8
+
+
+def load_music_history():
+    try:
+        data = json.loads(MUSIC_HISTORY_FILE.read_text(encoding="utf-8"))
+        return [str(x) for x in data.get("recent", [])]
+    except Exception:
+        return []
+
+
+def record_music_used(audio_id):
+    try:
+        MUSIC_HISTORY_FILE.parent.mkdir(parents=True, exist_ok=True)
+        recent = [str(audio_id)] + [x for x in load_music_history() if str(x) != str(audio_id)]
+        MUSIC_HISTORY_FILE.write_text(
+            json.dumps({"recent": recent[:MUSIC_HISTORY_KEEP]}, indent=2), encoding="utf-8")
+    except Exception as e:
+        log(f"could not record music history: {e}")
 
 
 def fetch_account_context(user_id, token):
@@ -723,8 +747,18 @@ def pick_audio_candidates(user_id, token, queries):
     eligible = [c for c in ranked if candidate_score(c) > 0]
     if not eligible and picked:
         log("ig_audio: no clearly instrumental/calm track in the eligible list — publishing without background music")
-    return [{"audio_id": str(c.get("audio_id")), "title": candidate_title(c), "score": candidate_score(c)}
-            for c in eligible[:4]]
+    candidates = [{"audio_id": str(c.get("audio_id")), "title": candidate_title(c), "score": candidate_score(c)}
+                  for c in eligible[:8]]
+    # Rotate: never reuse a track from the recent history while an unused one exists.
+    history = load_music_history()
+    fresh = [c for c in candidates if c["audio_id"] not in history]
+    used = [c for c in candidates if c["audio_id"] in history]
+    if fresh:
+        log(f"ig_audio: {len(fresh)} unused track(s) available — rotating away from the last "
+            f"{len(history)} used")
+    else:
+        log("ig_audio: every eligible track was used recently — falling back to least-recent order")
+    return (fresh + used)[:4]
 
 
 # ---------------------------------------------------------------------------
@@ -755,7 +789,7 @@ def create_container(user_id, token, caption, share_to_feed, audio_id=None, thum
     if location_id:
         params["location_id"] = str(location_id)
     if audio_id:
-        params["audio_configuration"] = json.dumps({"audio_id": str(audio_id), "audio_volume": 20})
+        params["audio_configuration"] = json.dumps({"audio_id": str(audio_id), "audio_volume": AUDIO_VOLUME_PCT})
     resp = graph_post(f"/{user_id}/media", params, token=token)
     container_id = resp.get("id")
     if not container_id:
@@ -1110,6 +1144,7 @@ def main():
             result["permalink"] = permalink
             if used_audio:
                 result["music"] = {"attached": True, "audio_id": used_audio["audio_id"], "title": used_audio["title"]}
+                record_music_used(used_audio["audio_id"])
             log(f"PUBLISHED: {permalink}")
         else:
             log("dry-run: skipping Instagram upload/publish")
