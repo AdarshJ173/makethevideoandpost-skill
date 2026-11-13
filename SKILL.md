@@ -1,7 +1,7 @@
 ---
 name: makethevideoandpost
 description: "Use when sent audio with makethevideoandpost → IG Reel."
-version: 1.0.0
+version: 1.1.0
 author: Hermes Agent (for @inatmania)
 license: MIT
 platforms: [linux]
@@ -14,8 +14,10 @@ metadata:
 
 Turns a raw audio file into a published **Instagram Reel** on @inatmania: minimalist
 pure black & white 1080p video, dead-center bold captions, no b-rolls, one-shot pipeline
-(STT → analytics → render → IG Audio API music → upload (`video_url` ingest, resumable as
-fallback) → publish → permalink).
+(STT → analytics → render → IG Audio API music → upload → publish → permalink).
+
+Two upload paths exist. **`video_url` ingest is the one that works on this box**; the
+resumable `rupload.facebook.com` POST is kept only as a fallback attempt. See PITFALLS.
 
 ## When to Use
 
@@ -28,6 +30,10 @@ together with any of these phrases:
 
 The platform exposes the downloaded file path in the incoming message; use that path.
 If only a voice-note reference exists, obtain the file path first, then run.
+
+If audio arrives with **no trigger phrase at all**, the intent is ambiguous and publishing is
+public and irreversible — ask once (`clarify`, first option "Yes — render and publish"), then run.
+Do not silently publish a memo the user meant as a draft.
 
 ## HARD RULES (user-locked — never weaken)
 
@@ -50,27 +56,37 @@ If only a voice-note reference exists, obtain the file path first, then run.
 ## How to run
 
 ```bash
-python3 ~/.hermes/scripts/makethevideoandpost.py "/path/to/audio.m4a"
+python3 ~/.hermes/scripts/makethevideoandpost.py "/path/to/audio.m4a" --upload-mode url
 ```
 
-Use a generous terminal timeout (600–900s): a 90s clip renders in well under a minute on this box,
-but long audio + container processing + publishing adds time.
+Defaults matter here:
+
+- `--upload-mode auto` (default) = one resumable attempt, then automatic `video_url` fallback.
+- `--upload-mode url` = skip the resumable attempt entirely. **Use this by default** — it removes
+  ~90 s of guaranteed failure per run and cannot leave a half-uploaded container behind.
+- `--upload-mode resumable` = debug only.
+
+Run it in the background (`terminal(background=true, notify=true)`) and pipe to a real log file,
+not `| tail`. `tail` buffers everything until exit and leaves you blind for five minutes:
+
+```bash
+python3 ~/.hermes/scripts/makethevideoandpost.py "<audio>" --upload-mode url > ~/.hermes/cache/scratch/run.log 2>&1
+```
 
 Parse the final output lines:
 
 - `PERMALINK: https://www.instagram.com/reel/…` → the live post URL (or `(dry-run)`)
-- `RESULT_JSON: {…}` → full decision record (aspect ratio, font, music, caption, stt_source)
+- `RESULT_JSON: {…}` → full decision record (aspect, font, music, caption, `stt_source`, `upload_mode`)
 
 **Do not run the script twice for the same audio** — if a previous run already returned a
-`PERMALINK`, that post is live and must not be duplicated.
+`PERMALINK`, that post is live and must not be duplicated. The one exception is a run that died
+after render and before publish (see RESCUE PATH).
 
 ## Reply format (Telegram — required)
 
-Reply with the live permalink, then a 2-line summary, e.g.:
-
 ```
 Published ✅ https://www.instagram.com/reel/XXXX/
-• 9:16 vertical (1080x1920) · Montserrat ExtraBold 72 · share_to_feed=true · STT: groq
+• 9:16 vertical (1080x1920) · Montserrat ExtraBold 72 · share_to_feed=false · STT: groq
 • Music: "Dark Ambient…" (audio_id 123) | no music · Caption: "<first line>"
 ```
 
@@ -87,75 +103,94 @@ If the run failed, reply with the failure reason and the last `[mtvap]` log line
   ("dark ambient instrumental", "melancholic piano instrumental", "slow minimal ambient",
   "calm dark cello"), attached via `audio_configuration` at `audio_volume: 20`.
   Fallbacks: next candidate (≤2 tries) → container without `audio_configuration` (never fails;
-  licensing subcode 2207065 handled).
+  licensing subcode 2207065 handled). The `video_url` path honours music the same way — if a
+  manual rescue publishes without `audio_configuration`, report "no music" honestly.
 - **Caption:** hook sentence from the transcript + top account hashtags + niche tags.
-- **Cover:** `thumb_offset=2000`; **upload:** resumable via `rupload.facebook.com`.
+- **Cover:** `thumb_offset=2000` (half the duration if the clip is <2.6s).
 
-Flags: `--dry-run` (render only, nothing published) · `--caption "…"` override ·
-`--location "City"` (attaches location_id when found) · `--keep-temp` · `--check-auth`
-(verifies IG creds via `GET /<IG_USER_ID>?fields=id,username`) · `--upload-mode auto|resumable|url`
-(`auto` default: one resumable attempt, then `video_url`; `url` skips resumable).
+## PITFALLS (hard-won — read this before debugging anything)
 
-`RESULT_JSON.upload_mode` records which path actually published the reel.
-
-## Environment requirements
-
-- `~/.hermes/.env` (chmod 600) must contain: `IG_USER_ID`, `IG_ACCESS_TOKEN`, `GROQ_API_KEY`,
-  `OPENROUTER_API_KEY`.
-- `ffmpeg` + `ffprobe` (with libass/libx264/loudnorm) — reinstall hook: `~/.agent37/hooks/post-image-update.sh`.
-- Fonts in `~/.local/share/fonts/` (Montserrat + Poppins + Inter) + `fc-cache -f`.
-- Local STT safety net (auto-installs once if both cloud APIs fail): `faster-whisper` small/int8 CPU.
-
-## Known pitfalls (hard-won — read before debugging an upload failure)
-
-1. **The resumable upload endpoint (`rupload.facebook.com`) is unreliable from this box —
-   use `video_url` ingest instead.** Symptom: `POST …/ig-api-upload/v27.0/<container>` returns
-   `{"type":"ProcessingFailedError","retriable":false,"message":"Request processing failed"}`
-   (http 400/500), sometimes with `Video Transcoding Error: both HD and SD progressive failed to
-   transcode`. The *same file* uploads and publishes fine when Instagram pulls it itself:
-   create the container with `media_type=REELS&video_url=<public mp4>` and poll
+1. **`rupload.facebook.com` is broken from this box; `video_url` ingest is not.**
+   Symptom: `POST …/ig-api-upload/v27.0/<container>` → http 400/500 with
+   `{"type":"ProcessingFailedError","retriable":false,"message":"Request processing failed"}`,
+   sometimes upgraded to `Video Transcoding Error: both HD and SD progressive failed to transcode`.
+   The identical file reaches `FINISHED` and publishes in one try when Instagram fetches it:
+   create the container with `media_type=REELS&video_url=<public mp4>`, poll
    `GET /<container>?fields=status_code` until `FINISHED`, then `media_publish`.
-   The script now does this automatically: `--upload-mode auto` (default) tries resumable once,
-   then falls back to serving the render via `agent37 expose` and passing `video_url`.
-   Use `--upload-mode url` to skip the doomed resumable attempt entirely (saves ~90s).
-2. **That error message is a liar.** It is identical for genuinely bad files and for perfectly
-   good ones, and it is not retriable. Nine retries across three containers produced nine
-   identical failures; the identical bytes then published through `video_url` on the first try.
-   Do not burn time bisecting size/bitrate/duration — go straight to the URL path, then
-   investigate the render only if the URL path also fails.
-3. **Audio sample rate still matters.** `loudnorm` upsamples to 96 kHz and `-c:a aac` keeps it, so
-   the renderer forces `-ar 48000` on the encoder and probes the output, aborting if it is not
-   44100/48000. Keep that guard: 96 kHz audio is rejected by every ingest path. Note this was
-   *not* the cause of the 2026-11 incident (the file already failed at 48 kHz too).
-4. **`aresample=48000` inside `-af` breaks mono** (`Cannot select channel layout…`) — put
-   `-ar 48000` on the encoder side instead.
-5. **`agent37 expose` reserves 8080 and 8443.** `http.server` on 8080 silently loses to the
-   platform's listener and you get a confusing 404. `LocalHoster` picks a free port from 8090 up.
-6. **Diagnose read-only.** `GET /<container_id>?fields=status_code` is free and unpublishable:
-   `IN_PROGRESS` forever = bytes never accepted, `FINISHED` = file is good to publish,
-   `ERROR` = real transcode failure. Also check `agent37 list-exposed` after a run — a crashed
-   URL-ingest run can leave a public port behind.
+   `LocalHoster` in the script does the serving + `agent37 expose` + teardown.
+2. **That error message lies.** It is byte-identical for good and bad renders and is marked
+   non-retriable, yet it fires intermittently depending on file duration — which tempts you into
+   a size/bitrate/duration bisection. That bisection burned ~20 probes and an hour and proved
+   nothing: 1080p failed at 30–86s, 360x640 passed at 60s, an 18 MB 5s clip passed. **Rule: if the
+   POST fails on a real render, switch to `video_url` immediately and only inspect the render if
+   the URL path also fails.**
+3. **Never re-render to "fix" an upload rejection** before testing the URL path. A 96 kHz audio
+   track was a real defect (see 4) but fixing it did not make the resumable path work — the file
+   was fine all along.
+4. **96 kHz audio must never ship.** `loudnorm` upsamples to 96 kHz and `-c:a aac` keeps it. The
+   renderer forces `-ar 48000` on the encoder and probes the output, aborting unless it is
+   44100/48000. Keep the guard and the flag.
+5. **`aresample=48000` inside `-af` breaks mono** — `Cannot select channel layout for the link
+   between filters`. Put `-ar 48000` on the encoder side, not in the filter chain.
+6. **Ports 8080 and 8443 are reserved by the platform.** `http.server` on 8080 loses to the
+   platform listener and answers 404 for your own file, which looks like a missing render.
+   `LocalHoster` picks a free port from 8090 upward; also `--bind 0.0.0.0`.
+7. **Diagnose read-only, never by publishing.** `GET /<container_id>?fields=status_code` costs
+   nothing: `IN_PROGRESS` forever = bytes never accepted; `FINISHED` = good to publish;
+   `ERROR` = real transcode failure. `fields=owner` is invalid on containers (error 100) — use
+   `status_code,status`.
+8. **Publish verification is a second call.** `media_publish` returns only a media id; fetch
+   `GET /<media_id>?fields=permalink,media_type,timestamp` to get the reel URL you report.
+9. **Clean up after a URL-ingest run:** `agent37 unexpose <port>`, kill the http server, delete
+   the render, then confirm with `agent37 list-exposed`. A crashed run leaves a public port serving
+   the file — that is an accidental public link to the user's content.
+10. **`status_code` polling needs ~60–90 s** before `FINISHED`; poll every 10 s, cap at ~10 min,
+    and do not interpret the first `IN_PROGRESS` as failure.
+
+## RESCUE PATH — run died after render, before publish
+
+When `--keep-temp` was used (or the run failed mid-way and the temp dir still exists):
+
+1. Find the render: `~/.hermes/cache/scratch/makethevideoandpost-*/reel.mp4` (+ `subs.ass`).
+2. Rebuild the caption without another STT call: import the script as a module, pull the burned-in
+   text out of `subs.ass`, and call `build_caption(text, ctx, mood)` with
+   `ctx = fetch_account_context(user_id, token)`.
+3. Publish through `video_url`: `LocalHoster(tmpdir)` → `create_container_smart(..., video_url=…)`
+   → `wait_finished` → `publish` → `fetch_permalink`.
+4. Tear down the hoster, then delete the temp dir. Report `upload_mode: video_url` and "no music"
+   if `audio_configuration` was not attached.
+
+This exact path published a real 86 s reel on the first attempt after nine resumable failures —
+it is the reliable fallback, not a hack.
 
 ## Troubleshooting
 
-- `ProcessingFailedError` on the rupload POST → switch to `--upload-mode url` (pitfall 1). This is
-  the expected failure mode here, not a symptom of a bad render.
-- `video_url` container stuck `IN_PROGRESS` >5 min → Instagram could not fetch the URL; check
-  `agent37 list-exposed`, that the port was reachable, and that the file is a plain `.mp4`.
+- `ProcessingFailedError` on the rupload POST → `--upload-mode url` (pitfall 1). Expected here.
+- `video_url` container stuck `IN_PROGRESS` >5 min → Instagram could not fetch the file: confirm the
+  public URL returns `Content-type: video/mp4` from outside, that the port is in `agent37 list-exposed`,
+  and that the path has no spaces.
 - Groq 429 / failure → OpenRouter fallback runs automatically; both failing → local faster-whisper.
-- Per-post insights require the `instagram_manage_insights` permission on the IG token. Without it, the
-  script skips them fast (circuit breaker) and proceeds with public metrics (likes/comments/timestamps,
-  hashtags) — that is expected behavior, not an error. Add the permission to the Meta app/token to enable them.
-- The IG Audio API may return a fixed 'eligible' list regardless of the mood query. The script keeps only
-  tracks that clearly match instrumental/calm/dark/melancholic keywords; if none match it publishes
-  **without** background music (by design — never off-brief audio).
-- `container status: ERROR/EXPIRED` → rerun with `--keep-temp` and read the last `[mtvap]` lines.
+- Per-post insights require `instagram_manage_insights`. Without it the script skips them fast and
+  proceeds with public metrics — expected behaviour, not an error.
+- The IG Audio API may return a fixed 'eligible' list regardless of mood. The script keeps only
+  clearly instrumental/calm/dark/melancholic tracks; if none match it publishes **without** music
+  (by design — never off-brief audio).
+- `container status: ERROR/EXPIRED` → rerun with `--keep-temp` and read the `[mtvap]` lines, then
+  use the RESCUE PATH.
 - `IG_ACCESS_TOKEN` expired → refresh via Meta Graph Explorer and re-upsert into `~/.hermes/.env`.
+
+## Environment requirements
+
+- `~/.hermes/.env` (chmod 600): `IG_USER_ID`, `IG_ACCESS_TOKEN`, `GROQ_API_KEY`, `OPENROUTER_API_KEY`.
+- `ffmpeg` + `ffprobe` (libass/libx264/loudnorm) — reinstall hook: `~/.agent37/hooks/post-image-update.sh`.
+- Fonts in `~/.local/share/fonts/` (Montserrat + Poppins + Inter) + `fc-cache -f`.
+- `agent37` CLI on PATH (needed for `expose`/`unexpose` on the URL-ingest path).
+- Local STT safety net (auto-installs once if both cloud APIs fail): `faster-whisper` small/int8 CPU.
 
 ## Backup & restore (public GitHub repo)
 
-- Repo (**public**): `makethevideoandpost-skill` —
-  `https://github.com/AdarshJ173/makethevideoandpost-skill` (public mirror maintained from this machine; restore instructions below).
+- Repo (**public**): `https://github.com/AdarshJ173/makethevideoandpost-skill`
+  (public mirror maintained from this machine; restore instructions below).
 - Restore on a fresh container:
 
 ```bash
@@ -166,3 +201,10 @@ mkdir -p ~/.hermes/skills/video/makethevideoandpost
 cp /tmp/mtvap-restore/SKILL.md ~/.hermes/skills/video/makethevideoandpost/SKILL.md
 # then re-add IG_USER_ID / IG_ACCESS_TOKEN / GROQ_API_KEY / OPENROUTER_API_KEY to ~/.hermes/.env (chmod 600)
 ```
+
+## Changelog
+
+- **1.1.0** — `video_url` ingest path (+ `LocalHoster`, `--upload-mode auto|resumable|url`);
+  `-ar 48000` render guard; PITFALLS + RESCUE PATH sections from the failed-upload incident;
+  verified end-to-end by publishing https://www.instagram.com/reel/DfryWhVE8PA/.
+- **1.0.0** — initial one-shot pipeline.
