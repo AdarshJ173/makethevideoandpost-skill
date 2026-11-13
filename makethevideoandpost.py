@@ -603,7 +603,7 @@ def render_video(audio_path, ass_path, out_mp4, res, duration) -> None:
         "-vf", f"subtitles={Path(ass_path).name}",
         "-af", "loudnorm=I=-16:TP=-1.5:LRA=11",
         "-c:v", "libx264", "-preset", "fast", "-crf", "18", "-pix_fmt", "yuv420p",
-        "-c:a", "aac", "-b:a", "192k",
+        "-c:a", "aac", "-b:a", "192k", "-ar", "48000",
         "-movflags", "+faststart",
         "-t", f"{max(0.05, float(duration)):.3f}",
         "-shortest",
@@ -612,6 +612,17 @@ def render_video(audio_path, ass_path, out_mp4, res, duration) -> None:
     proc = subprocess.run(cmd, cwd=str(Path(ass_path).parent), capture_output=True, text=True)
     if proc.returncode != 0:
         die(f"ffmpeg render failed:\n{proc.stderr[-1200:]}")
+    # Instagram's transcoder rejects non-44.1/48 kHz audio tracks outright
+    # ("both HD and SD progressive failed to transcode"), so verify before uploading.
+    probe = subprocess.run(
+        ["ffprobe", "-v", "error", "-select_streams", "a:0",
+         "-show_entries", "stream=sample_rate,channels", "-of", "csv=p=0", str(out_mp4)],
+        capture_output=True, text=True,
+    )
+    rate = (probe.stdout or "").strip().split(",")[0]
+    if rate not in ("44100", "48000"):
+        die(f"rendered audio sample rate is {rate or 'unknown'} Hz (must be 44100/48000) — Instagram would reject it")
+    log(f"audio track: {rate} Hz (IG-compatible)")
     for line in (proc.stderr or "").splitlines():
         if "fontselect" in line:
             log(line.strip())
@@ -728,13 +739,17 @@ def _is_audio_rejection(e: GraphError) -> bool:
     return "audio" in s and any(w in s for w in ("licens", "restrict", "not available", "not allowed", "invalid", "unsupported"))
 
 
-def create_container(user_id, token, caption, share_to_feed, audio_id=None, thumb_offset=2000, location_id=None):
+def create_container(user_id, token, caption, share_to_feed, audio_id=None, thumb_offset=2000, location_id=None, video_url=None):
     params = {
         "media_type": "REELS",
-        "upload_type": "resumable",
         "caption": caption,
         "share_to_feed": "true" if share_to_feed else "false",
     }
+    if video_url:
+        # Instagram pulls the file itself; no resumable upload step involved.
+        params["video_url"] = video_url
+    else:
+        params["upload_type"] = "resumable"
     if thumb_offset is not None:
         params["thumb_offset"] = str(int(thumb_offset))
     if location_id:
@@ -748,13 +763,13 @@ def create_container(user_id, token, caption, share_to_feed, audio_id=None, thum
     return container_id
 
 
-def create_container_smart(user_id, token, caption, share_to_feed, audio_candidates, thumb_offset, location_id=None):
+def create_container_smart(user_id, token, caption, share_to_feed, audio_candidates, thumb_offset, location_id=None, video_url=None):
     """Container with resilient music fallback: up to 2 audio tries, then no music."""
     for cand in (audio_candidates or [])[:2]:
         try:
             container_id = create_container(user_id, token, caption, share_to_feed,
                                             audio_id=cand["audio_id"], thumb_offset=thumb_offset,
-                                            location_id=location_id)
+                                            location_id=location_id, video_url=video_url)
             log(f"container created with audio '{cand['title'] or cand['audio_id']}' (audio_id={cand['audio_id']})")
             return container_id, cand
         except GraphError as e:
@@ -766,32 +781,154 @@ def create_container_smart(user_id, token, caption, share_to_feed, audio_candida
         log("no acceptable background audio — falling back to container WITHOUT audio_configuration")
     try:
         container_id = create_container(user_id, token, caption, share_to_feed,
-                                        audio_id=None, thumb_offset=thumb_offset, location_id=location_id)
+                                        audio_id=None, thumb_offset=thumb_offset, location_id=location_id,
+                                        video_url=video_url)
         return container_id, None
     except GraphError as e:
         if "thumb" in str(e).lower():
             log("thumb_offset rejected — retrying container without it")
             container_id = create_container(user_id, token, caption, share_to_feed,
-                                            audio_id=None, thumb_offset=None, location_id=location_id)
+                                            audio_id=None, thumb_offset=None, location_id=location_id,
+                                            video_url=video_url)
             return container_id, None
         raise
 
 
-def upload_video(container_id, token, mp4_path):
+class UploadFailed(Exception):
+    """Resumable upload rejected by Meta (transient ProcessingFailedError etc.)."""
+
+
+def upload_video(container_id, token, mp4_path, attempts=3):
     size = Path(mp4_path).stat().st_size
     url = f"{RUPLOAD}/{container_id}"
-    headers = {
-        "Authorization": f"OAuth {token}",
-        "offset": "0",
-        "file_size": str(size),
-        "Content-Type": "application/octet-stream",
-    }
     with open(mp4_path, "rb") as fh:
         raw = fh.read()
-    status, content = http_request("POST", url, headers=headers, body=raw, timeout=1200)
-    if not (200 <= status < 300):
-        die(f"resumable upload failed (http {status}): {_short(content, 400)}")
-    log(f"resumable upload: {size / 1e6:.1f} MB -> http {status}")
+    last = ""
+    for i in range(max(1, attempts)):
+        headers = {
+            "Authorization": f"OAuth {token}",
+            "offset": "0",
+            "file_size": str(size),
+            "Content-Type": "application/octet-stream",
+        }
+        status, content = http_request("POST", url, headers=headers, body=raw, timeout=1200)
+        if 200 <= status < 300:
+            log(f"resumable upload: {size / 1e6:.1f} MB -> http {status}")
+            return
+        last = f"http {status}: {_short(content, 300)}"
+        log(f"resumable upload attempt {i + 1}/{attempts} failed ({last})")
+        if i + 1 < attempts:
+            time.sleep(3 * (i + 1))
+    raise UploadFailed(last)
+
+
+def create_and_upload(user_id, token, mp4, caption, share_to_feed, audio_candidates,
+                      thumb_offset, location_id=None, rounds=3):
+    """Create a container and upload; on rejection recreate the container and retry.
+
+    Meta's rupload endpoint intermittently returns
+    {"type":"ProcessingFailedError","retriable":false} for perfectly valid files;
+    a fresh container + retry is the pragmatic fix.
+    """
+    last = ""
+    for r in range(max(1, rounds)):
+        container_id, used_audio = create_container_smart(
+            user_id, token, caption, share_to_feed, audio_candidates, thumb_offset, location_id)
+        log(f"container: {container_id}" + (f" (round {r + 1}/{rounds})" if r else ""))
+        try:
+            upload_video(container_id, token, mp4)
+            return container_id, used_audio
+        except UploadFailed as e:
+            last = str(e)
+            log(f"upload rejected on container {container_id} — retrying with a fresh container")
+            time.sleep(3 * (r + 1))
+    die(f"resumable upload failed after {rounds} containers: {last}")
+
+
+def _free_port(start=8090, tries=60):
+    import socket
+    for p in range(start, start + tries):
+        with socket.socket() as s:
+            try:
+                s.bind(("127.0.0.1", p))
+                return p
+            except OSError:
+                continue
+    raise RuntimeError("no free port available")
+
+
+class LocalHoster:
+    """Serve a directory over HTTP and publish it with `agent37 expose`.
+
+    Used for the video_url ingest path: Instagram downloads the render itself,
+    which bypasses the resumable-upload endpoint entirely.
+    """
+
+    def __init__(self, directory):
+        self.directory = str(directory)
+        self.proc = None
+        self.port = None
+        self.url = None
+
+    def __enter__(self):
+        self.port = _free_port()
+        self.proc = subprocess.Popen(
+            [sys.executable, "-m", "http.server", str(self.port), "--bind", "0.0.0.0"],
+            cwd=self.directory, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        deadline = time.time() + 15
+        while time.time() < deadline:
+            try:
+                with urllib.request.urlopen(f"http://127.0.0.1:{self.port}/", timeout=2):
+                    break
+            except Exception:
+                time.sleep(0.3)
+        out = subprocess.run(["agent37", "expose", str(self.port), "--label", "reel-ingest"],
+                             capture_output=True, text=True, timeout=180)
+        payload = None
+        for line in (out.stdout or "").splitlines():
+            line = line.strip()
+            if line.startswith("{") and '"url"' in line:
+                try:
+                    payload = json.loads(line)
+                except Exception:
+                    continue
+        if not payload or not payload.get("url"):
+            self._stop()
+            die(f"agent37 expose failed for port {self.port}: {(out.stdout or '')[-300:]}{(out.stderr or '')[-300:]}")
+        self.url = payload["url"].rstrip("/")
+        log(f"public ingest URL: {self.url}")
+        return self
+
+    def _stop(self):
+        if self.proc is not None:
+            self.proc.terminate()
+            try:
+                self.proc.wait(timeout=10)
+            except Exception:
+                self.proc.kill()
+            self.proc = None
+
+    def __exit__(self, *exc):
+        if self.port:
+            subprocess.run(["agent37", "unexpose", str(self.port)], capture_output=True, text=True, timeout=120)
+        self._stop()
+        return False
+
+
+def publish_via_url(user_id, token, mp4_path, caption, share_to_feed, audio_candidates,
+                    thumb_offset, location_id=None):
+    """Create the container with video_url so Instagram fetches the render itself."""
+    mp4_path = Path(mp4_path)
+    with LocalHoster(mp4_path.parent) as hoster:
+        video_url = f"{hoster.url}/{urllib.parse.quote(mp4_path.name)}"
+        log(f"handing video_url to Instagram: {video_url}")
+        container_id, used_audio = create_container_smart(
+            user_id, token, caption, share_to_feed, audio_candidates,
+            thumb_offset, location_id, video_url=video_url)
+        log(f"container: {container_id}")
+        wait_finished(container_id, token)
+        return container_id, used_audio
 
 
 def wait_finished(container_id, token, timeout_s=900, interval=5):
@@ -854,6 +991,8 @@ def main():
     parser.add_argument("--caption", default=None, help="Override the auto-generated caption.")
     parser.add_argument("--location", default=None, help="Place name to attach via location_id when found.")
     parser.add_argument("--keep-temp", action="store_true", help="Keep temporary render files (debugging).")
+    parser.add_argument("--upload-mode", choices=["auto", "resumable", "url"], default="auto",
+                        help="auto = try resumable upload, then fall back to video_url ingest (default).")
     parser.add_argument("--check-auth", action="store_true", help="Verify IG creds (GET /<IG_USER_ID>?fields=id,username) and exit.")
     args = parser.parse_args()
 
@@ -945,12 +1084,26 @@ def main():
             audio_candidates = pick_audio_candidates(user_id, token, plan["music_queries"])
             if audio_candidates:
                 log("audio candidates: " + ", ".join(f"{c['title'] or c['audio_id']} (score {c['score']})" for c in audio_candidates))
-            container_id, used_audio = create_container_smart(user_id, token, caption, plan["share_to_feed"],
-                                                              audio_candidates, thumb_offset, location_id)
-            log(f"container: {container_id}")
-            upload_video(container_id, token, mp4)
-            log("waiting for container processing…")
-            wait_finished(container_id, token)
+            container_id = used_audio = None
+            if args.upload_mode in ("auto", "resumable"):
+                try:
+                    container_id, used_audio = create_and_upload(
+                        user_id, token, mp4, caption, plan["share_to_feed"],
+                        audio_candidates, thumb_offset, location_id,
+                        rounds=3 if args.upload_mode == "resumable" else 1)
+                except SystemExit:
+                    if args.upload_mode == "resumable":
+                        raise
+                    log("resumable upload path rejected the render — falling back to video_url ingest")
+            if container_id is None:
+                container_id, used_audio = publish_via_url(
+                    user_id, token, mp4, caption, plan["share_to_feed"],
+                    audio_candidates, thumb_offset, location_id)
+                result["upload_mode"] = "video_url"
+            else:
+                result["upload_mode"] = "resumable"
+                log("waiting for container processing…")
+                wait_finished(container_id, token)
             media_id = publish(user_id, token, container_id)
             permalink = fetch_permalink(media_id, token)
             result["media_id"] = media_id

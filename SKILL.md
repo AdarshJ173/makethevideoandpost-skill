@@ -14,7 +14,8 @@ metadata:
 
 Turns a raw audio file into a published **Instagram Reel** on @inatmania: minimalist
 pure black & white 1080p video, dead-center bold captions, no b-rolls, one-shot pipeline
-(STT → analytics → render → IG Audio API music → resumable upload → publish → permalink).
+(STT → analytics → render → IG Audio API music → upload (`video_url` ingest, resumable as
+fallback) → publish → permalink).
 
 ## When to Use
 
@@ -92,7 +93,10 @@ If the run failed, reply with the failure reason and the last `[mtvap]` log line
 
 Flags: `--dry-run` (render only, nothing published) · `--caption "…"` override ·
 `--location "City"` (attaches location_id when found) · `--keep-temp` · `--check-auth`
-(verifies IG creds via `GET /<IG_USER_ID>?fields=id,username`).
+(verifies IG creds via `GET /<IG_USER_ID>?fields=id,username`) · `--upload-mode auto|resumable|url`
+(`auto` default: one resumable attempt, then `video_url`; `url` skips resumable).
+
+`RESULT_JSON.upload_mode` records which path actually published the reel.
 
 ## Environment requirements
 
@@ -102,8 +106,42 @@ Flags: `--dry-run` (render only, nothing published) · `--caption "…"` overrid
 - Fonts in `~/.local/share/fonts/` (Montserrat + Poppins + Inter) + `fc-cache -f`.
 - Local STT safety net (auto-installs once if both cloud APIs fail): `faster-whisper` small/int8 CPU.
 
+## Known pitfalls (hard-won — read before debugging an upload failure)
+
+1. **The resumable upload endpoint (`rupload.facebook.com`) is unreliable from this box —
+   use `video_url` ingest instead.** Symptom: `POST …/ig-api-upload/v27.0/<container>` returns
+   `{"type":"ProcessingFailedError","retriable":false,"message":"Request processing failed"}`
+   (http 400/500), sometimes with `Video Transcoding Error: both HD and SD progressive failed to
+   transcode`. The *same file* uploads and publishes fine when Instagram pulls it itself:
+   create the container with `media_type=REELS&video_url=<public mp4>` and poll
+   `GET /<container>?fields=status_code` until `FINISHED`, then `media_publish`.
+   The script now does this automatically: `--upload-mode auto` (default) tries resumable once,
+   then falls back to serving the render via `agent37 expose` and passing `video_url`.
+   Use `--upload-mode url` to skip the doomed resumable attempt entirely (saves ~90s).
+2. **That error message is a liar.** It is identical for genuinely bad files and for perfectly
+   good ones, and it is not retriable. Nine retries across three containers produced nine
+   identical failures; the identical bytes then published through `video_url` on the first try.
+   Do not burn time bisecting size/bitrate/duration — go straight to the URL path, then
+   investigate the render only if the URL path also fails.
+3. **Audio sample rate still matters.** `loudnorm` upsamples to 96 kHz and `-c:a aac` keeps it, so
+   the renderer forces `-ar 48000` on the encoder and probes the output, aborting if it is not
+   44100/48000. Keep that guard: 96 kHz audio is rejected by every ingest path. Note this was
+   *not* the cause of the 2026-11 incident (the file already failed at 48 kHz too).
+4. **`aresample=48000` inside `-af` breaks mono** (`Cannot select channel layout…`) — put
+   `-ar 48000` on the encoder side instead.
+5. **`agent37 expose` reserves 8080 and 8443.** `http.server` on 8080 silently loses to the
+   platform's listener and you get a confusing 404. `LocalHoster` picks a free port from 8090 up.
+6. **Diagnose read-only.** `GET /<container_id>?fields=status_code` is free and unpublishable:
+   `IN_PROGRESS` forever = bytes never accepted, `FINISHED` = file is good to publish,
+   `ERROR` = real transcode failure. Also check `agent37 list-exposed` after a run — a crashed
+   URL-ingest run can leave a public port behind.
+
 ## Troubleshooting
 
+- `ProcessingFailedError` on the rupload POST → switch to `--upload-mode url` (pitfall 1). This is
+  the expected failure mode here, not a symptom of a bad render.
+- `video_url` container stuck `IN_PROGRESS` >5 min → Instagram could not fetch the URL; check
+  `agent37 list-exposed`, that the port was reachable, and that the file is a plain `.mp4`.
 - Groq 429 / failure → OpenRouter fallback runs automatically; both failing → local faster-whisper.
 - Per-post insights require the `instagram_manage_insights` permission on the IG token. Without it, the
   script skips them fast (circuit breaker) and proceeds with public metrics (likes/comments/timestamps,
